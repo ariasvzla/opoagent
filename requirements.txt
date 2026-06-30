@@ -1,0 +1,5 @@
+deepagents
+fastapi
+uvicorn[standard]
+langchain-anthropic
+langchain-deepseek

@@ -18,3 +18,5 @@ Detectar problemas, vacíos, contradicciones o referencias obsoletas en los info
 
 ## Formato de salida
 Responde en español, con claridad, precisión y orientación práctica.
+
+

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from agents.tools import build_document_prompt, save_uploaded_file, extract_text_from_file
+from main import FileInput, build_prompt_with_files
 
 
 def test_save_uploaded_file_and_extract_text(tmp_path):
@@ -19,3 +20,22 @@ def test_build_document_prompt_uses_summary_default_when_prompt_is_empty():
 
     assert "resumen" in prompt.lower()
     assert "qué desea hacer" in prompt.lower() or "qué quiere hacer" in prompt.lower()
+
+
+def test_build_prompt_with_files_adds_low_input_temario_guidance():
+    files = [FileInput(name="convocatoria.txt", content="Convocatoria de oposicion", mime_type="text/plain")]
+
+    prompt = build_prompt_with_files("", files)
+
+    assert "haz solo estas 2 preguntas" in prompt.lower()
+    assert "tipo de proceso selectivo" in prompt.lower()
+    assert "salida esperada" in prompt.lower()
+
+
+def test_extract_text_from_invalid_pdf_uses_text_fallback(tmp_path):
+    fake_pdf = tmp_path / "invalid.pdf"
+    fake_pdf.write_text("PROG contenido de prueba", encoding="utf-8")
+
+    extracted = extract_text_from_file(str(fake_pdf))
+
+    assert "PROG" in extracted

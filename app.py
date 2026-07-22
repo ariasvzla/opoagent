@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import chainlit as cl
 import websockets
 from agents.tools import extract_text_from_file
@@ -11,6 +12,34 @@ SUGGESTED_PROMPTS = [
     "Coordina el flujo completo para generar un temario de oposiciones desde el mandato inicial.",
     "Revisa normativamente un bloque de temario y propón mejoras para la redacción.",
 ]
+
+
+def parse_parallel_request(raw_prompt: str) -> tuple[str, list[str], int]:
+    """Parse optional inline TEMAS/PARALLELISM directives from chat text."""
+    text = raw_prompt or ""
+    parallelism = 3
+    temas: list[str] = []
+
+    parallel_match = re.search(r"(?im)^\s*parallelism\s*:\s*(\d+)\s*$", text)
+    if parallel_match:
+        try:
+            parallelism = max(1, min(int(parallel_match.group(1)), 10))
+        except ValueError:
+            parallelism = 3
+
+    temas_block = re.search(r"(?ims)^\s*temas\s*:\s*$([\s\S]*)", text)
+    if temas_block:
+        block = temas_block.group(1)
+        for line in block.splitlines():
+            bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", line)
+            if bullet:
+                temas.append(bullet.group(1))
+
+        # Remove directives from the natural-language prompt.
+        text = re.sub(r"(?im)^\s*parallelism\s*:\s*\d+\s*$", "", text)
+        text = re.sub(r"(?ims)^\s*temas\s*:\s*$[\s\S]*", "", text)
+
+    return text.strip(), temas, parallelism
 
 
 async def connect_to_backend():
@@ -87,42 +116,91 @@ async def on_message(message: cl.Message):
     await msg_stream.send()
 
     stage_messages = []
+    render_lock = asyncio.Lock()
+    loader_running = True
+    loader_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    loader_index = 0
+
+    async def render(final_text: str | None = None) -> None:
+        nonlocal loader_index
+        async with render_lock:
+            if final_text is not None:
+                msg_stream.content = final_text
+                await msg_stream.update()
+                return
+
+            if loader_running:
+                frame = loader_frames[loader_index % len(loader_frames)]
+                loader_index += 1
+                header = f"{frame} El agente esta trabajando..."
+            else:
+                header = "✅ Proceso finalizado"
+
+            lines = [header]
+            if stage_messages:
+                lines.extend(["", *stage_messages])
+            msg_stream.content = "\n".join(lines)
+            await msg_stream.update()
+
+    async def loader_loop() -> None:
+        while loader_running:
+            await render()
+            await asyncio.sleep(0.35)
+
+    loader_task = asyncio.create_task(loader_loop())
 
     try:
         attached_files = getattr(message, "elements", None) or []
+        normalized_prompt, temas, parallelism = parse_parallel_request(message.content)
         payload = json.dumps({
-            "prompt": message.content,
+            "prompt": normalized_prompt,
             "files": serialize_uploaded_files(attached_files),
+            "temas": temas,
+            "parallelism": parallelism,
         })
         await ws_client.send(payload)
 
         while True:
-            response = await asyncio.wait_for(ws_client.recv(), timeout=300.0)
+            response = await asyncio.wait_for(ws_client.recv(), timeout=84600.0)
             data = json.loads(response)
             event_type = data.get("type")
 
-            if event_type == "stage":
+            if event_type in {
+                "stage",
+                "subagent_started",
+                "subagent_completed",
+                "subagent_failed",
+                "tool_started",
+                "tool_completed",
+                "tool_failed",
+            }:
                 text = data.get("message", "")
                 if text:
                     stage_messages.append(text)
-                    msg_stream.content = "\n".join(stage_messages)
-                    await msg_stream.update()
+                    await render()
+                continue
+
+            if event_type == "tool_output_delta":
+                delta = data.get("message", "")
+                if delta:
+                    stage_messages.append(f"  ↳ {delta}")
+                    await render()
                 continue
 
             if event_type == "result":
                 token = data.get("message", "")
                 if token:
+                    loader_running = False
                     if stage_messages:
-                        msg_stream.content = "\n".join(stage_messages + ["", f"✅ Respuesta final:\n{token}"])
+                        await render("\n".join(stage_messages + ["", f"✅ Respuesta final:\n{token}"]))
                     else:
-                        msg_stream.content = token
-                    await msg_stream.update()
+                        await render(token)
                 break
 
             if event_type == "error":
+                loader_running = False
                 details = data.get("message", "Error desconocido")
-                msg_stream.content = "\n".join(stage_messages + [f"\n[Error en la comunicación WS: {details}]"])
-                await msg_stream.update()
+                await render("\n".join(stage_messages + [f"\n[Error en la comunicación WS: {details}]"]))
                 return
 
             if event_type == "status":
@@ -130,15 +208,22 @@ async def on_message(message: cl.Message):
 
             token = data.get("message", data.get("text", ""))
             if token:
-                msg_stream.content = token
-                await msg_stream.update()
+                await render(token)
 
     except asyncio.TimeoutError:
-        msg_stream.content = "\n[La respuesta del agente no llegó a tiempo.]"
-        await msg_stream.update()
+        loader_running = False
+        await render("\n[La respuesta del agente no llego a tiempo.]")
     except Exception as e:
-        msg_stream.content = f"\n[Error en la comunicación WS: {str(e)}]"
-        await msg_stream.update()
+        loader_running = False
+        await render(f"\n[Error en la comunicacion WS: {str(e)}]")
+    finally:
+        loader_running = False
+        if loader_task:
+            loader_task.cancel()
+            try:
+                await loader_task
+            except asyncio.CancelledError:
+                pass
 
 
 @cl.on_chat_end

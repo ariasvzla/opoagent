@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from agents.tools import build_document_prompt, save_uploaded_file, extract_text_from_file
+from agents.tools import save_uploaded_file, extract_text_from_file
+from prompts.builders import build_document_prompt
 from main import FileInput, build_prompt_with_files
 
 

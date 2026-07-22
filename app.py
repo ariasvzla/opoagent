@@ -14,11 +14,10 @@ SUGGESTED_PROMPTS = [
 ]
 
 
-def parse_parallel_request(raw_prompt: str) -> tuple[str, list[str], int, int]:
-    """Parse optional inline TEMAS/PARALLELISM/BATCH_SIZE directives from chat text."""
+def parse_parallel_request(raw_prompt: str) -> tuple[str, list[str], int]:
+    """Parse optional inline TEMAS/PARALLELISM directives from chat text."""
     text = raw_prompt or ""
     parallelism = 10
-    batch_size = 10
     temas: list[str] = []
 
     parallel_match = re.search(r"(?im)^\s*parallelism\s*:\s*(\d+)\s*$", text)
@@ -27,13 +26,6 @@ def parse_parallel_request(raw_prompt: str) -> tuple[str, list[str], int, int]:
             parallelism = max(1, min(int(parallel_match.group(1)), 10))
         except ValueError:
             parallelism = 10
-
-    batch_match = re.search(r"(?im)^\s*batch_size\s*:\s*(\d+)\s*$", text)
-    if batch_match:
-        try:
-            batch_size = max(1, min(int(batch_match.group(1)), 50))
-        except ValueError:
-            batch_size = 10
 
     temas_block = re.search(r"(?ims)^\s*temas\s*:\s*$([\s\S]*)", text)
     if temas_block:
@@ -45,10 +37,9 @@ def parse_parallel_request(raw_prompt: str) -> tuple[str, list[str], int, int]:
 
         # Remove directives from the natural-language prompt.
         text = re.sub(r"(?im)^\s*parallelism\s*:\s*\d+\s*$", "", text)
-        text = re.sub(r"(?im)^\s*batch_size\s*:\s*\d+\s*$", "", text)
         text = re.sub(r"(?ims)^\s*temas\s*:\s*$[\s\S]*", "", text)
 
-    return text.strip(), temas, parallelism, batch_size
+    return text.strip(), temas, parallelism
 
 
 async def connect_to_backend():
@@ -160,13 +151,12 @@ async def on_message(message: cl.Message):
 
     try:
         attached_files = getattr(message, "elements", None) or []
-        normalized_prompt, temas, parallelism, batch_size = parse_parallel_request(message.content)
+        normalized_prompt, temas, parallelism = parse_parallel_request(message.content)
         payload = json.dumps({
             "prompt": normalized_prompt,
             "files": serialize_uploaded_files(attached_files),
             "temas": temas,
             "parallelism": parallelism,
-            "batch_size": batch_size,
         })
         await ws_client.send(payload)
 
@@ -177,6 +167,7 @@ async def on_message(message: cl.Message):
 
             if event_type in {
                 "stage",
+                "agent_state",
                 "subagent_started",
                 "subagent_completed",
                 "subagent_failed",

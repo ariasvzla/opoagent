@@ -1,21 +1,21 @@
 import asyncio
 import json
+import os
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Optional
 from uuid import uuid4
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from agents import build_agent
+from agents import build_agent, get_cached_agent
+from agents.pipeline import run_temas_parallel
 from agents.tools import (
-    assemble_document,
-    build_document_prompt,
     create_run_workspace,
-    create_tema_workspace,
     save_uploaded_file,
     set_output_workspace,
     set_progress_callback,
 )
+from prompts.builders import build_document_prompt
 
 
 app = FastAPI(title="Deep Agents FastAPI", version="0.1.0")
@@ -29,7 +29,8 @@ app.add_middleware(
 
 
 def get_agent():
-    return build_agent()
+    """Return the cached agent instance (built once per process)."""
+    return get_cached_agent()
 
 
 class FileInput(BaseModel):
@@ -43,7 +44,6 @@ class InvokeRequest(BaseModel):
     files: list[FileInput] = []
     temas: list[str] = []
     parallelism: int = 10
-    batch_size: int = 10
 
 
 @app.get("/health")
@@ -51,11 +51,20 @@ def health():
     return {"status": "ok"}
 
 
+def _files_for_pipeline(files: list[FileInput]) -> list[dict]:
+    """Convert FileInput list to plain dicts for the pipeline analyser."""
+    return [
+        {"name": f.name, "content": f.content, "mime_type": f.mime_type or ""}
+        for f in files
+    ]
+
+
 def build_prompt_with_files(prompt: str, files: list[FileInput]) -> str:
     prompt_text = build_document_prompt(prompt, [{"name": file.name, "content": file.content} for file in files])
 
-    if not (prompt or "").strip() and files:
-        # Keep user input minimal by asking only for the two critical unknowns.
+    # Only inject clarifying questions for single-run chat mode (no files).
+    # When files are present, the pipeline analyser handles discovery.
+    if not (prompt or "").strip() and not files:
         prompt_text = (
             f"{prompt_text}\n\n"
             "Si el usuario quiere construir un temario, antes de producir el documento final "
@@ -123,35 +132,6 @@ def _extract_final_message(payload: Any) -> str:
     return _stringify_content(payload)
 
 
-def _build_tema_prompt(base_prompt: str, tema: str) -> str:
-    return (
-        f"{base_prompt}\n\n"
-        f"Tema objetivo: {tema}\n"
-        "Desarrolla exclusivamente este tema. No mezcles contenido de otros temas. "
-        "Si necesitas referencias cruzadas, limitalas a una seccion breve de conexiones."
-    )
-
-
-def _build_test_prompt(tema: str, tema_content: str) -> str:
-    return (
-        "Actua como el subagente generador_tests para oposiciones. "
-        "A partir del contenido del tema, genera un test practico de calidad.\n\n"
-        f"Tema: {tema}\n\n"
-        "Requisitos:\n"
-        "- Genera 20 preguntas tipo test (A, B, C, D).\n"
-        "- Marca la respuesta correcta en cada pregunta.\n"
-        "- Incluye explicacion breve por respuesta correcta.\n"
-        "- Mantente fiel al contenido dado, no inventes normativa externa.\n\n"
-        "Contenido base del tema:\n"
-        f"{tema_content}"
-    )
-
-
-def _chunked(items: list[str], size: int) -> list[list[str]]:
-    chunk_size = max(1, size)
-    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
-
-
 def _preview_text(value: str, limit: int = 160) -> str:
     clean = " ".join((value or "").strip().split())
     if len(clean) <= limit:
@@ -159,162 +139,27 @@ def _preview_text(value: str, limit: int = 160) -> str:
     return clean[: limit - 3] + "..."
 
 
-async def _run_temas_parallel(
-    base_prompt: str,
-    temas: list[str],
-    parallelism: int,
-    batch_size: int,
-    progress_hook: Optional[Callable[[str], Awaitable[None]]] = None,
-) -> dict[str, Any]:
-    run_id = f"run-{uuid4().hex[:10]}"
-    run_workspace = create_run_workspace(run_id)
-    semaphore = asyncio.Semaphore(max(1, min(parallelism, 10)))
-    tema_results: list[dict[str, Any]] = []
-    test_results: list[dict[str, Any]] = []
-
-    async def process_tema(index: int, tema: str) -> dict[str, Any]:
-        tema_label = f"tema-{index + 1:02d}"
-        tema_workspace = create_tema_workspace(run_id, tema_label)
-
-        if progress_hook is not None:
-            await progress_hook(
-                f"🤖 [redactor_especialista] Inicia {tema_label} sobre contenido: {_preview_text(tema)}"
-            )
-
-        async with semaphore:
-            def invoke_one() -> str:
-                set_output_workspace(tema_workspace)
-                try:
-                    agent = get_agent()
-                    prompt = _build_tema_prompt(base_prompt, tema)
-                    result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
-                    message = _extract_final_message(result)
-                    markdown_path = Path(tema_workspace) / "tema-content.md"
-                    markdown_path.write_text(message or "", encoding="utf-8")
-                    return message
-                finally:
-                    set_output_workspace(None)
-
-            message = await asyncio.to_thread(invoke_one)
-            if progress_hook is not None:
-                await progress_hook(
-                    f"✅ [redactor_especialista] Completa {tema_label}. Salida: {_preview_text(message)}"
-                )
-            return {
-                "tema": tema,
-                "tema_label": tema_label,
-                "workspace": tema_workspace,
-                "message": message,
-                "content_filename": f"{tema_label}/tema-content.md",
-            }
-
-    async def process_tests(item: dict[str, Any]) -> dict[str, Any]:
-        tema = item["tema"]
-        tema_label = item["tema_label"]
-        tema_workspace = item["workspace"]
-        tema_content = item["message"] or ""
-
-        if progress_hook is not None:
-            await progress_hook(
-                f"🧪 [generador_tests] Inicia {tema_label} sobre contenido: {_preview_text(tema_content)}"
-            )
-
-        async with semaphore:
-            def invoke_tests() -> str:
-                set_output_workspace(tema_workspace)
-                try:
-                    agent = get_agent()
-                    prompt = _build_test_prompt(tema, tema_content)
-                    result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
-                    message = _extract_final_message(result)
-                    markdown_path = Path(tema_workspace) / "tema-tests.md"
-                    markdown_path.write_text(message or "", encoding="utf-8")
-                    return message
-                finally:
-                    set_output_workspace(None)
-
-            tests_message = await asyncio.to_thread(invoke_tests)
-            if progress_hook is not None:
-                await progress_hook(
-                    f"✅ [generador_tests] Completa {tema_label}. Salida: {_preview_text(tests_message)}"
-                )
-            return {
-                "tema": tema,
-                "tema_label": tema_label,
-                "workspace": tema_workspace,
-                "message": tests_message,
-                "tests_filename": f"{tema_label}/tema-tests.md",
-            }
-
-    batches = _chunked(temas, max(1, batch_size))
-    global_index = 0
-    for batch_idx, batch in enumerate(batches, start=1):
-        if progress_hook is not None:
-            await progress_hook(f"🚀 Lote {batch_idx}/{len(batches)}: generando {len(batch)} tema(s).")
-
-        processed = await asyncio.gather(
-            *(process_tema(global_index + i, tema) for i, tema in enumerate(batch))
-        )
-        tema_results.extend(processed)
-        global_index += len(batch)
-
-    test_batches = _chunked([item["tema_label"] for item in tema_results], max(1, batch_size))
-    label_to_item = {item["tema_label"]: item for item in tema_results}
-    for batch_idx, test_batch in enumerate(test_batches, start=1):
-        if progress_hook is not None:
-            await progress_hook(f"🧪 Lote test {batch_idx}/{len(test_batches)}: generando tests para {len(test_batch)} tema(s).")
-
-        processed_tests = await asyncio.gather(
-            *(process_tests(label_to_item[label]) for label in test_batch)
-        )
-        test_results.extend(processed_tests)
-
-    def assemble_all() -> str:
-        set_output_workspace(run_workspace)
-        try:
-            filenames = [item["content_filename"] for item in tema_results]
-            title = "Temario consolidado"
-            return assemble_document(title=title, filenames=filenames, output_filename="temario-final.docx")
-        finally:
-            set_output_workspace(None)
-
-    def assemble_tests() -> str:
-        set_output_workspace(run_workspace)
-        try:
-            filenames = [item["tests_filename"] for item in test_results]
-            title = "Tests de practica del temario"
-            return assemble_document(title=title, filenames=filenames, output_filename="temario-tests.docx")
-        finally:
-            set_output_workspace(None)
-
-    final_doc = await asyncio.to_thread(assemble_all)
-    tests_doc = await asyncio.to_thread(assemble_tests)
-    return {
-        "run_id": run_id,
-        "run_workspace": run_workspace,
-        "final_doc": final_doc,
-        "tests_doc": tests_doc,
-        "items": tema_results,
-        "test_items": test_results,
-    }
-
-
 @app.post("/invoke")
 def invoke(request: InvokeRequest):
     full_prompt = build_prompt_with_files(request.prompt, request.files)
     temas = [tema.strip() for tema in (request.temas or []) if tema and tema.strip()]
 
-    if len(temas) > 1:
+    if len(temas) > 1 or request.files:
         batch_result = asyncio.run(
-            _run_temas_parallel(full_prompt, temas, request.parallelism, request.batch_size)
+            run_temas_parallel(
+                full_prompt, temas, request.parallelism,
+                files=_files_for_pipeline(request.files),
+            )
         )
+        stats = batch_result.get("stats", {})
         return {
-            "message": "Temario y tests procesados en paralelo por lotes.",
+            "message": f"Temario procesado: {stats.get('successful', 0)}/{stats.get('total', 0)} exitosos.",
             "run_id": batch_result["run_id"],
             "run_workspace": batch_result["run_workspace"],
             "final_doc": batch_result["final_doc"],
-            "tests_doc": batch_result["tests_doc"],
-            "items": [{"tema": item["tema"], "workspace": item["workspace"]} for item in batch_result["items"]],
+            "s3_url": batch_result.get("s3_url", ""),
+            "items": [{"tema": item["tema"], "workspace": item["workspace"], "status": "failed" if item.get("error") else "ok"} for item in batch_result["items"]],
+            "stats": stats,
         }
 
     run_id = f"run-{uuid4().hex[:10]}"
@@ -323,7 +168,8 @@ def invoke(request: InvokeRequest):
     try:
         agent = get_agent()
         result = agent.invoke(
-            {"messages": [{"role": "user", "content": full_prompt}]}
+            {"messages": [{"role": "user", "content": full_prompt}]},
+            config={"recursion_limit": int(os.getenv("RECURSION_LIMIT", "50"))},
         )
         message = _extract_final_message(result)
         (Path(run_workspace) / "final-response.md").write_text(message or "", encoding="utf-8")
@@ -347,7 +193,6 @@ async def websocket_endpoint(websocket: WebSocket):
             prompt = payload.get("prompt") or ""
             temas = [tema.strip() for tema in (payload.get("temas") or []) if isinstance(tema, str) and tema.strip()]
             parallelism = int(payload.get("parallelism") or 10)
-            batch_size = int(payload.get("batch_size") or 10)
             files = []
             for raw_file in payload.get("files", []) or []:
                 try:
@@ -359,7 +204,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             full_prompt = build_prompt_with_files(prompt, files)
             single_run_workspace = ""
-            is_parallel_request = len(temas) > 1
+            is_parallel_request = len(temas) > 1 or bool(files)
             if not is_parallel_request:
                 single_run_id = f"run-{uuid4().hex[:10]}"
                 single_run_workspace = create_run_workspace(single_run_id)
@@ -368,7 +213,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_json({"type": "stage", "message": "🧠 Coordinator started planning the documentation workflow."})
             if files:
                 await websocket.send_json({"type": "stage", "message": f"📎 Se analizarán {len(files)} archivo(s) adjunto(s)."})
-            await websocket.send_json({"type": "stage", "message": "🤖 The agent is now thinking through the document structure."})
+                await websocket.send_json({"type": "stage", "message": "🤖 The agent is now thinking through the document structure."})
             if single_run_workspace:
                 await websocket.send_json({"type": "stage", "message": f"📂 Workspace temporal: {single_run_workspace}"})
 
@@ -383,22 +228,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 set_output_workspace(single_run_workspace)
             try:
                 if is_parallel_request:
-                    await websocket.send_json({
-                        "type": "stage",
-                        "message": (
-                            f"⚙️ Detectados {len(temas)} temas. "
-                            f"Procesando en lotes de {max(1, batch_size)} con max {max(1, min(parallelism, 10))} simultaneos."
-                        ),
-                    })
+                    max_conc = max(1, min(parallelism, int(os.getenv("MAX_PARALLELISM", "20"))))
+                    if temas:
+                        await websocket.send_json({
+                            "type": "stage",
+                            "message": (
+                                f"⚙️ {len(temas)} tema(s) recibido(s). "
+                                f"Procesando con max {max_conc} simultáneos."
+                            ),
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "stage",
+                            "message": (
+                                "🔍 Analizando el documento para detectar "
+                                "y extraer los temas automáticamente..."
+                            ),
+                        })
 
                     async def notify_progress(progress_message: str) -> None:
                         await websocket.send_json({"type": "stage", "message": progress_message})
 
-                    batch_result = await _run_temas_parallel(
+                    batch_result = await run_temas_parallel(
                         full_prompt,
                         temas,
                         parallelism,
-                        batch_size,
+                        files=_files_for_pipeline(files),
                         progress_hook=notify_progress,
                     )
                     await websocket.send_json({
@@ -409,14 +264,23 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "stage",
                         "message": f"📄 Documento final: {batch_result['final_doc']}",
                     })
-                    await websocket.send_json({
-                        "type": "stage",
-                        "message": f"🧪 Documento de tests: {batch_result['tests_doc']}",
-                    })
+                    s3_url = batch_result.get("s3_url", "")
+                    if s3_url:
+                        await websocket.send_json({
+                            "type": "stage",
+                            "message": f"☁️ Publicado en S3: {s3_url}",
+                        })
 
+                    stats = batch_result.get("stats", {})
+                    if stats.get("failed", 0) > 0:
+                        await websocket.send_json({
+                            "type": "stage",
+                            "message": f"⚠️ {stats['failed']} tema(s) fallido(s); ver failures.md en el workspace.",
+                        })
+                    
                     summary_lines = [
-                        "Temario y tests procesados en paralelo:",
-                        *[f"- {item['tema']} ({item['workspace']})" for item in batch_result["items"]],
+                        f"✅ Procesamiento completado: {stats.get('successful', 0)}/{stats.get('total', 0)} temas exitosos",
+                        *[f"- {item['tema']} ({item['workspace']}) — {'❌ Error' if item.get('error') else '✅ OK'}" for item in batch_result["items"]],
                     ]
                     await websocket.send_json({"type": "result", "message": "\n".join(summary_lines)})
                     await websocket.send_json({"type": "stage", "message": "✅ Parallel tema + tests workflow completed."})
@@ -428,8 +292,78 @@ async def websocket_endpoint(websocket: WebSocket):
                 subagent_run_names: dict[str, str] = {}
                 final_message = ""
 
+                agent_labels = {
+                    "analizador_tematario": "Analizador de temario",
+                    "coordinador_general": "Coordinador general",
+                    "calibrador": "Calibrador",
+                    "fuentes_normativas": "Fuentes normativas",
+                    "revision_normativa": "Revisión normativa",
+                    "redactor_especialista": "Redactor especialista",
+                    "pnl_pedagogico": "PNL pedagógico",
+                    "revision_calidad": "Revisión de calidad",
+                    "coherencia_bloque": "Coherencia de bloque",
+                    "generador_tests": "Generador de tests",
+                    "maquetador": "Maquetador",
+                }
+
+                agent_start_states = {
+                    "analizador_tematario": "está analizando el temario y estructurando bloques.",
+                    "coordinador_general": "está organizando el flujo de trabajo.",
+                    "calibrador": "está calibrando el enfoque del contenido.",
+                    "fuentes_normativas": "está revisando normativa aplicable.",
+                    "revision_normativa": "está validando consistencia normativa.",
+                    "redactor_especialista": "está redactando el contenido del tema.",
+                    "pnl_pedagogico": "está enriqueciendo el enfoque didáctico.",
+                    "revision_calidad": "está evaluando la calidad del contenido.",
+                    "coherencia_bloque": "está verificando coherencia entre temas.",
+                    "generador_tests": "está generando preguntas tipo test.",
+                    "maquetador": "está maquetando y ensamblando el documento final.",
+                }
+
+                def _find_parent_subagent(event_payload: dict[str, Any]) -> str:
+                    parent_ids = event_payload.get("parent_ids") or []
+                    if not isinstance(parent_ids, list):
+                        return ""
+                    for parent_id in reversed(parent_ids):
+                        subagent = subagent_run_names.get(str(parent_id))
+                        if subagent:
+                            return subagent
+                    return ""
+
+                async def _emit_agent_state(subagent_name: str, status: str, detail: str = "") -> None:
+                    normalized = (subagent_name or "").strip()
+                    label = agent_labels.get(normalized, normalized or "Subagente")
+
+                    if status == "started":
+                        state = agent_start_states.get(normalized, "está procesando la solicitud.")
+                        message = f"🤖 {label}: {state}"
+                        if detail:
+                            message += f" Objetivo: {_preview_text(detail)}"
+                    elif status == "completed":
+                        message = f"✅ {label}: completado."
+                    elif status == "failed":
+                        message = f"❌ {label}: error durante la ejecución."
+                        if detail:
+                            message += f" Detalle: {_preview_text(detail)}"
+                    elif status == "assembling":
+                        message = f"🧩 {label}: está ensamblando el documento .docx."
+                    elif status == "assembled":
+                        message = f"📄 {label}: ensamblado del .docx completado."
+                    else:
+                        message = f"ℹ️ {label}: {status}"
+
+                    await websocket.send_json({
+                        "type": "agent_state",
+                        "subagent": normalized or "subagente",
+                        "status": status,
+                        "message": message,
+                    })
+
                 try:
-                    async for event in agent.astream_events(payload_input, version="v2"):
+                    async for event in agent.astream_events(
+                        payload_input, version="v2",
+                        config={"recursion_limit": int(os.getenv("RECURSION_LIMIT", "50"))},
+                    ):
                         event_name = event.get("event") or ""
                         event_data = event.get("data") or {}
                         run_id = str(event.get("run_id") or "")
@@ -453,21 +387,11 @@ async def websocket_endpoint(websocket: WebSocket):
                                         or ""
                                     )
                                 subagent_run_names[run_id] = subagent_name
-                                await websocket.send_json({
-                                    "type": "subagent_started",
-                                    "subagent": subagent_name,
-                                    "message": (
-                                        f"Subagente iniciado: {subagent_name}. "
-                                        f"Objetivo: {_preview_text(target_content)}"
-                                    ),
-                                })
+                                await _emit_agent_state(subagent_name, "started", target_content)
                             else:
-                                input_preview = _preview_text(_stringify_content(tool_input))
-                                await websocket.send_json({
-                                    "type": "tool_started",
-                                    "tool": tool_name,
-                                    "message": f"Herramienta iniciada: {tool_name}. Entrada: {input_preview}",
-                                })
+                                owner_subagent = _find_parent_subagent(event)
+                                if tool_name == "assemble_document":
+                                    await _emit_agent_state(owner_subagent or "maquetador", "assembling")
                             continue
 
                         if event_name == "on_tool_end":
@@ -476,42 +400,20 @@ async def websocket_endpoint(websocket: WebSocket):
 
                             if tool_name == "task":
                                 subagent_name = subagent_run_names.pop(run_id, "subagente")
-                                await websocket.send_json({
-                                    "type": "subagent_completed",
-                                    "subagent": subagent_name,
-                                    "message": (
-                                        f"Subagente completado: {subagent_name}. "
-                                        f"Salida: {_preview_text(preview)}"
-                                    ),
-                                })
+                                await _emit_agent_state(subagent_name, "completed", preview)
                             else:
-                                await websocket.send_json({
-                                    "type": "tool_completed",
-                                    "tool": tool_name,
-                                    "message": f"Herramienta completada: {tool_name}.",
-                                })
-                                if preview:
-                                    await websocket.send_json({
-                                        "type": "tool_output_delta",
-                                        "tool": tool_name,
-                                        "message": preview,
-                                    })
+                                owner_subagent = _find_parent_subagent(event)
+                                if tool_name == "assemble_document":
+                                    await _emit_agent_state(owner_subagent or "maquetador", "assembled", preview)
                             continue
 
                         if event_name == "on_tool_error":
                             if tool_name == "task":
                                 subagent_name = subagent_run_names.pop(run_id, "subagente")
-                                await websocket.send_json({
-                                    "type": "subagent_failed",
-                                    "subagent": subagent_name,
-                                    "message": f"Subagente con error: {subagent_name}",
-                                })
+                                await _emit_agent_state(subagent_name, "failed")
                             else:
-                                await websocket.send_json({
-                                    "type": "tool_failed",
-                                    "tool": tool_name,
-                                    "message": f"Herramienta con error: {tool_name}",
-                                })
+                                owner_subagent = _find_parent_subagent(event)
+                                await _emit_agent_state(owner_subagent or "subagente", "failed", tool_name)
                             continue
 
                         if event_name in {"on_chain_end", "on_graph_end"}:
@@ -522,7 +424,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 except Exception:
                     # Fallback to non-streaming execution if event streaming is unavailable.
-                    result = await asyncio.to_thread(agent.invoke, payload_input)
+                    result = await asyncio.to_thread(
+                        lambda: agent.invoke(
+                            payload_input,
+                            config={"recursion_limit": int(os.getenv("RECURSION_LIMIT", "50"))},
+                        )
+                    )
                     final_message = _extract_final_message(result)
 
                 message = final_message or "Proceso completado sin mensaje final estructurado."
@@ -530,7 +437,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     (Path(single_run_workspace) / "final-response.md").write_text(message or "", encoding="utf-8")
 
                 await websocket.send_json({"type": "result", "message": message})
-                await websocket.send_json({"type": "stage", "message": "✅ Documentation workflow completed."})
+                await websocket.send_json({"type": "stage", "message": "✅ Flujo de documentación completado."})
             except Exception as agent_error:
                 import traceback
                 error_trace = traceback.format_exc()

@@ -1,3 +1,3 @@
-from .builder import build_agent
+from .builder import build_agent, get_cached_agent
 
-__all__ = ["build_agent"]
+__all__ = ["build_agent", "get_cached_agent"]

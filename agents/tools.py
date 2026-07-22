@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -23,6 +24,9 @@ _workspace_dir: contextvars.ContextVar[Optional[Path]] = contextvars.ContextVar(
 
 def _safe_slug(value: str) -> str:
     raw = (value or "workspace").strip().lower()
+    # Normalize unicode: é → e + combining accent, then strip accents
+    raw = unicodedata.normalize("NFKD", raw)
+    raw = "".join(c for c in raw if not unicodedata.combining(c))
     slug = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-")
     return slug or "workspace"
 
@@ -108,20 +112,6 @@ def extract_text_from_file(file_path: str) -> str:
     return f"unsupported file type: {suffix or 'unknown'}"
 
 
-def build_document_prompt(prompt: str, files: list[dict]) -> str:
-    """Build a prompt that supports document-only uploads and asks for a summary plus next steps."""
-    normalized_prompt = (prompt or "").strip()
-    if normalized_prompt:
-        return normalized_prompt
-
-    file_names = ", ".join(item.get("name", "archivo") for item in files or [])
-    return (
-        "Analiza el contenido del documento adjunto y proporciona un resumen claro y útil. "
-        f"Documentos recibidos: {file_names or 'sin nombre'}. "
-        "Además, pregunta al usuario qué desea hacer con este documento y ofrece opciones prácticas para el siguiente paso."
-    )
-
-
 def save_uploaded_file(filename: str, content: str) -> str:
     """Persist uploaded text content to disk so the agent can inspect it."""
     safe_name = Path(filename).name
@@ -136,12 +126,13 @@ def read_uploaded_file(path: str) -> str:
 
 
 def save_section(filename: str, content: str) -> str:
-    """Save a generated markdown section to disk."""
-    emit_progress(f"📝 Writing section {filename}...")
-    path = get_output_dir() / filename
+    """Save a generated markdown section to disk with a safe filename."""
+    safe_name = _safe_slug(Path(filename).stem) + Path(filename).suffix
+    emit_progress(f"📝 Writing section {safe_name}...")
+    path = get_output_dir() / safe_name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    emit_progress(f"✅ Saved section {filename}.")
+    emit_progress(f"✅ Saved section {safe_name}.")
     return f"saved:{path}"
 
 
@@ -249,15 +240,26 @@ def assemble_document(title: str, filenames: list[str], output_filename: str = "
     document.add_heading(title, level=1)
 
     output_dir = get_output_dir()
+    added_sections = 0
 
     for name in filenames:
-        path = output_dir / name
+        raw_path = Path(name)
+        path = raw_path if raw_path.is_absolute() else (output_dir / raw_path)
         if not path.exists():
             continue
 
         content = path.read_text(encoding="utf-8")
+        if not content.strip():
+            continue
         _render_markdown_to_docx(document, content)
         document.add_paragraph("")
+        added_sections += 1
+
+    if added_sections == 0:
+        document.add_paragraph(
+            "No se pudo incluir contenido en el documento. "
+            "Revisa failures.md y los archivos tema-content.md/tema-tests.md del workspace."
+        )
 
     final_path = output_dir / output_filename
     final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -266,8 +268,19 @@ def assemble_document(title: str, filenames: list[str], output_filename: str = "
     return f"assembled:{final_path}"
 
 
-def upload_document_to_s3(filename: str = "05-final-document.docx", bucket: Optional[str] = None, key: Optional[str] = None) -> str:
-    """Upload the assembled markdown document to S3 when the bucket is configured."""
+def upload_document_to_s3(
+    filename: str = "05-final-document.docx",
+    bucket: Optional[str] = None,
+    key: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> str:
+    """Upload the assembled document to S3 with a meaningful path.
+
+    When ``run_id`` is provided the key becomes:
+        runs/{run_id}/{filename}
+
+    Otherwise falls back to ``key`` or just the filename.
+    """
     emit_progress(f"☁️ Preparing to upload {filename} to S3...")
 
     resolved_bucket = bucket or os.getenv("S3_BUCKET")
@@ -279,7 +292,12 @@ def upload_document_to_s3(filename: str = "05-final-document.docx", bucket: Opti
     if not path.exists():
         emit_progress(f"⚠️ S3 upload skipped because {path} does not exist.")
         return f"skipped:missing-file:{filename}"
-    resolved_key = key or filename
+
+    # Build a meaningful key: runs/{run_id}/{filename}
+    if run_id:
+        resolved_key = f"runs/{run_id}/{Path(filename).name}"
+    else:
+        resolved_key = key or filename
     region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
     try:
         sts_client = boto3.client("sts", region_name=region)

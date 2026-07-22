@@ -1,5 +1,8 @@
-deepagents
+deepagents==0.6.12
 fastapi
 uvicorn[standard]
 langchain-anthropic
 langchain-deepseek
+boto3
+python-docx
+pypdf

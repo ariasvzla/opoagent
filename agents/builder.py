@@ -1,89 +1,88 @@
 import os
 from deepagents import create_deep_agent
-from .tools import save_section, read_section, assemble_document
+from langchain_deepseek import ChatDeepSeek
+from prompts import AGENT_SYSTEM_PROMPT, ANALIZADOR_TEMARIO_PROMPT, CALIBRADOR_PROMPT, COHERENCIA_BLOQUE_PROMPT, COORDINADOR_GENERAL_PROMPT, FUENTES_NORMATIVAS_PROMPT, GENERADOR_TESTS_PROMPT, MAQUETADOR_PROMPT, PNL_PEDAGOGICO_PROMPT, REDACTOR_ESPECIALISTA_PROMPT, REVISION_CALIDAD_PROMPT, REVISION_NUMERICA_PROMPT
+from .tools import save_section, read_section, assemble_document, upload_document_to_s3, read_uploaded_file
 
+model_llm = ChatDeepSeek(
+    model="deepseek-v4-flash",
+    temperature=0.2
+)
 
 def build_agent():
-    model = os.environ["MODEL"]
-
     subagents = [
         {
-            "name": "intro_writer",
-            "description": "Writes the introduction and scope for a technical markdown document.",
-            "system_prompt": """
-You write concise markdown for the introduction of a technical document.
-Always return markdown only.
-When appropriate, save output using save_section with filename 01-introduction.md.
-""",
-            "tools": [save_section],
+            "name": "analizador_tematario",
+            "description": "Analiza la convocatoria, identifica el tipo de proceso selectivo y estructura el temario en bloques relacionales y mandatos de proyecto.",
+            "system_prompt": ANALIZADOR_TEMARIO_PROMPT,
+            "tools": [save_section, read_section, read_uploaded_file],
         },
         {
-            "name": "requirements_writer",
-            "description": "Writes prerequisites, dependencies, assumptions, and environment variables.",
-            "system_prompt": """
-You write the requirements section for a technical document.
-Always return markdown only.
-When appropriate, save output using save_section with filename 02-requirements.md.
-""",
-            "tools": [save_section],
+            "name": "coordinador_general",
+            "description": "Coordina el flujo global del proyecto, gestiona estados, prerequisitos y comunicación con el usuario.",
+            "system_prompt": COORDINADOR_GENERAL_PROMPT,
+            "tools": [save_section, read_section, assemble_document],
         },
         {
-            "name": "architecture_writer",
-            "description": "Writes the architecture section for coordinator and subagent responsibilities.",
-            "system_prompt": """
-You write the architecture section for a multi-agent system.
-Always return markdown only.
-Explain coordinator, subagents, and message flow.
-When appropriate, save output using save_section with filename 03-architecture.md.
-""",
-            "tools": [save_section],
+            "name": "calibrador",
+            "description": "Analiza el temario completo y el tipo de proceso para preparar la calibración general del contenido y la orientación de la producción.",
+            "system_prompt": CALIBRADOR_PROMPT,
+            "tools": [save_section, read_section, read_uploaded_file],
         },
         {
-            "name": "deployment_writer",
-            "description": "Writes Docker and runtime deployment instructions.",
-            "system_prompt": """
-You write deployment instructions for a Dockerized Python service.
-Always return markdown only.
-Include build and run commands.
-When appropriate, save output using save_section with filename 04-deployment.md.
-""",
-            "tools": [save_section],
+            "name": "fuentes_normativas",
+            "description": "Revisa y estructura la base normativa por bloque, detectando normativa relevante, derogada o conflictiva.",
+            "system_prompt": FUENTES_NORMATIVAS_PROMPT,
+            "tools": [save_section, read_section, read_uploaded_file],
         },
         {
-            "name": "reviewer",
-            "description": "Reviews all generated sections for consistency and prepares the final assembly plan.",
-            "system_prompt": """
-You review generated markdown sections for consistency, duplication, and missing details.
-Always return markdown only.
-Use read_section when needed.
-""",
-            "tools": [read_section],
+            "name": "revision_numerica",
+            "description": "Revisa informes normativos, detecta problemas y propone correcciones o mejoras para los bloques.",
+            "system_prompt": REVISION_NUMERICA_PROMPT,
+            "tools": [save_section, read_section, read_uploaded_file],
+        },
+        {
+            "name": "redactor_especialista",
+            "description": "Redacta el contenido temático de cada tema dentro de un bloque, guiado por informes normativos y de calibración.",
+            "system_prompt": REDACTOR_ESPECIALISTA_PROMPT,
+            "tools": [save_section, read_section, read_uploaded_file],
+        },
+        {
+            "name": "pnl_pedagogico",
+            "description": "Enriquece el texto del tema con enfoque pedagógico, didáctico y de conexión entre epígrafes.",
+            "system_prompt": PNL_PEDAGOGICO_PROMPT,
+            "tools": [save_section, read_section, read_uploaded_file],
+        },
+        {
+            "name": "revision_calidad",
+            "description": "Evalúa la calidad del contenido ya revisado normativamente y decide si el tema está listo o necesita corrección.",
+            "system_prompt": REVISION_CALIDAD_PROMPT,
+            "tools": [save_section, read_section, read_uploaded_file],
+        },
+        {
+            "name": "coherencia_bloque",
+            "description": "Verifica la consistencia interna entre los temas aprobados de un bloque y detecta problemas de solapamiento o incoherencia.",
+            "system_prompt": COHERENCIA_BLOQUE_PROMPT,
+            "tools": [save_section, read_section, read_uploaded_file],
+        },
+        {
+            "name": "generador_tests",
+            "description": "Genera preguntas tipo test para los temas ya aprobados, adaptadas al tipo de prueba y al contexto del proceso selectivo.",
+            "system_prompt": GENERADOR_TESTS_PROMPT,
+            "tools": [save_section, read_section, read_uploaded_file],
+        },
+        {
+            "name": "maquetador",
+            "description": "Compone el tema final con texto y preguntas en un formato listo para entrega y validación humana.",
+            "system_prompt": MAQUETADOR_PROMPT,
+            "tools": [save_section, read_section, assemble_document],
         },
     ]
 
     return create_deep_agent(
-        model=model,
-        tools=[save_section, read_section, assemble_document],
+        model=model_llm,
+        tools=[save_section, read_section, assemble_document, upload_document_to_s3, read_uploaded_file],
         subagents=subagents,
-        system_prompt="""
-You are the coordinator for a technical document generation system.
-
-Your workflow:
-1. Break the request into sections.
-2. Delegate introduction to intro_writer.
-3. Delegate requirements to requirements_writer.
-4. Delegate architecture to architecture_writer.
-5. Delegate deployment to deployment_writer.
-6. Ask reviewer to inspect the generated sections.
-7. Assemble the final document with assemble_document.
-8. Return a concise completion message and mention the output filenames.
-
-Preferred filenames:
-- 01-introduction.md
-- 02-requirements.md
-- 03-architecture.md
-- 04-deployment.md
-- 05-final-document.md
-""",
+        system_prompt=AGENT_SYSTEM_PROMPT,
         name="document_coordinator",
     )

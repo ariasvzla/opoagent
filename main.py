@@ -1,7 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 from uuid import uuid4
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,7 +42,8 @@ class InvokeRequest(BaseModel):
     prompt: str
     files: list[FileInput] = []
     temas: list[str] = []
-    parallelism: int = 3
+    parallelism: int = 10
+    batch_size: int = 10
 
 
 @app.get("/health")
@@ -131,19 +132,54 @@ def _build_tema_prompt(base_prompt: str, tema: str) -> str:
     )
 
 
+def _build_test_prompt(tema: str, tema_content: str) -> str:
+    return (
+        "Actua como el subagente generador_tests para oposiciones. "
+        "A partir del contenido del tema, genera un test practico de calidad.\n\n"
+        f"Tema: {tema}\n\n"
+        "Requisitos:\n"
+        "- Genera 20 preguntas tipo test (A, B, C, D).\n"
+        "- Marca la respuesta correcta en cada pregunta.\n"
+        "- Incluye explicacion breve por respuesta correcta.\n"
+        "- Mantente fiel al contenido dado, no inventes normativa externa.\n\n"
+        "Contenido base del tema:\n"
+        f"{tema_content}"
+    )
+
+
+def _chunked(items: list[str], size: int) -> list[list[str]]:
+    chunk_size = max(1, size)
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _preview_text(value: str, limit: int = 160) -> str:
+    clean = " ".join((value or "").strip().split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 3] + "..."
+
+
 async def _run_temas_parallel(
     base_prompt: str,
     temas: list[str],
     parallelism: int,
+    batch_size: int,
+    progress_hook: Optional[Callable[[str], Awaitable[None]]] = None,
 ) -> dict[str, Any]:
     run_id = f"run-{uuid4().hex[:10]}"
     run_workspace = create_run_workspace(run_id)
     semaphore = asyncio.Semaphore(max(1, min(parallelism, 10)))
-    results: list[dict[str, Any]] = []
+    tema_results: list[dict[str, Any]] = []
+    test_results: list[dict[str, Any]] = []
 
     async def process_tema(index: int, tema: str) -> dict[str, Any]:
         tema_label = f"tema-{index + 1:02d}"
         tema_workspace = create_tema_workspace(run_id, tema_label)
+
+        if progress_hook is not None:
+            await progress_hook(
+                f"🤖 [redactor_especialista] Inicia {tema_label} sobre contenido: {_preview_text(tema)}"
+            )
 
         async with semaphore:
             def invoke_one() -> str:
@@ -153,39 +189,113 @@ async def _run_temas_parallel(
                     prompt = _build_tema_prompt(base_prompt, tema)
                     result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
                     message = _extract_final_message(result)
-                    markdown_path = Path(tema_workspace) / "tema-final.md"
+                    markdown_path = Path(tema_workspace) / "tema-content.md"
                     markdown_path.write_text(message or "", encoding="utf-8")
                     return message
                 finally:
                     set_output_workspace(None)
 
             message = await asyncio.to_thread(invoke_one)
+            if progress_hook is not None:
+                await progress_hook(
+                    f"✅ [redactor_especialista] Completa {tema_label}. Salida: {_preview_text(message)}"
+                )
             return {
                 "tema": tema,
                 "tema_label": tema_label,
                 "workspace": tema_workspace,
                 "message": message,
-                "filename": f"{tema_label}/tema-final.md",
+                "content_filename": f"{tema_label}/tema-content.md",
             }
 
-    processed = await asyncio.gather(*(process_tema(i, tema) for i, tema in enumerate(temas)))
-    results.extend(processed)
+    async def process_tests(item: dict[str, Any]) -> dict[str, Any]:
+        tema = item["tema"]
+        tema_label = item["tema_label"]
+        tema_workspace = item["workspace"]
+        tema_content = item["message"] or ""
+
+        if progress_hook is not None:
+            await progress_hook(
+                f"🧪 [generador_tests] Inicia {tema_label} sobre contenido: {_preview_text(tema_content)}"
+            )
+
+        async with semaphore:
+            def invoke_tests() -> str:
+                set_output_workspace(tema_workspace)
+                try:
+                    agent = get_agent()
+                    prompt = _build_test_prompt(tema, tema_content)
+                    result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+                    message = _extract_final_message(result)
+                    markdown_path = Path(tema_workspace) / "tema-tests.md"
+                    markdown_path.write_text(message or "", encoding="utf-8")
+                    return message
+                finally:
+                    set_output_workspace(None)
+
+            tests_message = await asyncio.to_thread(invoke_tests)
+            if progress_hook is not None:
+                await progress_hook(
+                    f"✅ [generador_tests] Completa {tema_label}. Salida: {_preview_text(tests_message)}"
+                )
+            return {
+                "tema": tema,
+                "tema_label": tema_label,
+                "workspace": tema_workspace,
+                "message": tests_message,
+                "tests_filename": f"{tema_label}/tema-tests.md",
+            }
+
+    batches = _chunked(temas, max(1, batch_size))
+    global_index = 0
+    for batch_idx, batch in enumerate(batches, start=1):
+        if progress_hook is not None:
+            await progress_hook(f"🚀 Lote {batch_idx}/{len(batches)}: generando {len(batch)} tema(s).")
+
+        processed = await asyncio.gather(
+            *(process_tema(global_index + i, tema) for i, tema in enumerate(batch))
+        )
+        tema_results.extend(processed)
+        global_index += len(batch)
+
+    test_batches = _chunked([item["tema_label"] for item in tema_results], max(1, batch_size))
+    label_to_item = {item["tema_label"]: item for item in tema_results}
+    for batch_idx, test_batch in enumerate(test_batches, start=1):
+        if progress_hook is not None:
+            await progress_hook(f"🧪 Lote test {batch_idx}/{len(test_batches)}: generando tests para {len(test_batch)} tema(s).")
+
+        processed_tests = await asyncio.gather(
+            *(process_tests(label_to_item[label]) for label in test_batch)
+        )
+        test_results.extend(processed_tests)
 
     def assemble_all() -> str:
         set_output_workspace(run_workspace)
         try:
-            filenames = [item["filename"] for item in results]
+            filenames = [item["content_filename"] for item in tema_results]
             title = "Temario consolidado"
             return assemble_document(title=title, filenames=filenames, output_filename="temario-final.docx")
         finally:
             set_output_workspace(None)
 
+    def assemble_tests() -> str:
+        set_output_workspace(run_workspace)
+        try:
+            filenames = [item["tests_filename"] for item in test_results]
+            title = "Tests de practica del temario"
+            return assemble_document(title=title, filenames=filenames, output_filename="temario-tests.docx")
+        finally:
+            set_output_workspace(None)
+
     final_doc = await asyncio.to_thread(assemble_all)
+    tests_doc = await asyncio.to_thread(assemble_tests)
     return {
         "run_id": run_id,
         "run_workspace": run_workspace,
         "final_doc": final_doc,
-        "items": results,
+        "tests_doc": tests_doc,
+        "items": tema_results,
+        "test_items": test_results,
     }
 
 
@@ -193,22 +303,33 @@ async def _run_temas_parallel(
 def invoke(request: InvokeRequest):
     full_prompt = build_prompt_with_files(request.prompt, request.files)
     temas = [tema.strip() for tema in (request.temas or []) if tema and tema.strip()]
+
     if len(temas) > 1:
-        batch_result = asyncio.run(_run_temas_parallel(full_prompt, temas, request.parallelism))
+        batch_result = asyncio.run(
+            _run_temas_parallel(full_prompt, temas, request.parallelism, request.batch_size)
+        )
         return {
-            "message": "Temas procesados en paralelo.",
+            "message": "Temario y tests procesados en paralelo por lotes.",
             "run_id": batch_result["run_id"],
             "run_workspace": batch_result["run_workspace"],
             "final_doc": batch_result["final_doc"],
+            "tests_doc": batch_result["tests_doc"],
             "items": [{"tema": item["tema"], "workspace": item["workspace"]} for item in batch_result["items"]],
         }
 
-    agent = get_agent()
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": full_prompt}]}
-    )
-    message = result["messages"][-1].content
-    return {"message": message}
+    run_id = f"run-{uuid4().hex[:10]}"
+    run_workspace = create_run_workspace(run_id)
+    set_output_workspace(run_workspace)
+    try:
+        agent = get_agent()
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": full_prompt}]}
+        )
+        message = _extract_final_message(result)
+        (Path(run_workspace) / "final-response.md").write_text(message or "", encoding="utf-8")
+        return {"message": message, "run_id": run_id, "run_workspace": run_workspace}
+    finally:
+        set_output_workspace(None)
 
 
 @app.websocket("/ws")
@@ -225,7 +346,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
             prompt = payload.get("prompt") or ""
             temas = [tema.strip() for tema in (payload.get("temas") or []) if isinstance(tema, str) and tema.strip()]
-            parallelism = int(payload.get("parallelism") or 3)
+            parallelism = int(payload.get("parallelism") or 10)
+            batch_size = int(payload.get("batch_size") or 10)
             files = []
             for raw_file in payload.get("files", []) or []:
                 try:
@@ -236,12 +358,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
 
             full_prompt = build_prompt_with_files(prompt, files)
+            single_run_workspace = ""
+            is_parallel_request = len(temas) > 1
+            if not is_parallel_request:
+                single_run_id = f"run-{uuid4().hex[:10]}"
+                single_run_workspace = create_run_workspace(single_run_id)
 
             await websocket.send_json({"type": "status", "message": "started"})
             await websocket.send_json({"type": "stage", "message": "🧠 Coordinator started planning the documentation workflow."})
             if files:
                 await websocket.send_json({"type": "stage", "message": f"📎 Se analizarán {len(files)} archivo(s) adjunto(s)."})
             await websocket.send_json({"type": "stage", "message": "🤖 The agent is now thinking through the document structure."})
+            if single_run_workspace:
+                await websocket.send_json({"type": "stage", "message": f"📂 Workspace temporal: {single_run_workspace}"})
 
             async def send_progress(event_type: str, message: str) -> None:
                 try:
@@ -250,14 +379,28 @@ async def websocket_endpoint(websocket: WebSocket):
                     pass
 
             set_progress_callback(send_progress)
+            if single_run_workspace:
+                set_output_workspace(single_run_workspace)
             try:
-                if len(temas) > 1:
+                if is_parallel_request:
                     await websocket.send_json({
                         "type": "stage",
-                        "message": f"⚙️ Procesando {len(temas)} temas en paralelo (max {max(1, min(parallelism, 10))} simultaneos).",
+                        "message": (
+                            f"⚙️ Detectados {len(temas)} temas. "
+                            f"Procesando en lotes de {max(1, batch_size)} con max {max(1, min(parallelism, 10))} simultaneos."
+                        ),
                     })
 
-                    batch_result = await _run_temas_parallel(full_prompt, temas, parallelism)
+                    async def notify_progress(progress_message: str) -> None:
+                        await websocket.send_json({"type": "stage", "message": progress_message})
+
+                    batch_result = await _run_temas_parallel(
+                        full_prompt,
+                        temas,
+                        parallelism,
+                        batch_size,
+                        progress_hook=notify_progress,
+                    )
                     await websocket.send_json({
                         "type": "stage",
                         "message": f"📂 Workspace temporal: {batch_result['run_workspace']}",
@@ -266,13 +409,17 @@ async def websocket_endpoint(websocket: WebSocket):
                         "type": "stage",
                         "message": f"📄 Documento final: {batch_result['final_doc']}",
                     })
+                    await websocket.send_json({
+                        "type": "stage",
+                        "message": f"🧪 Documento de tests: {batch_result['tests_doc']}",
+                    })
 
                     summary_lines = [
-                        "Temas procesados en paralelo:",
+                        "Temario y tests procesados en paralelo:",
                         *[f"- {item['tema']} ({item['workspace']})" for item in batch_result["items"]],
                     ]
                     await websocket.send_json({"type": "result", "message": "\n".join(summary_lines)})
-                    await websocket.send_json({"type": "stage", "message": "✅ Parallel tema workflow completed."})
+                    await websocket.send_json({"type": "stage", "message": "✅ Parallel tema + tests workflow completed."})
                     continue
 
                 agent = get_agent()
@@ -292,17 +439,34 @@ async def websocket_endpoint(websocket: WebSocket):
                             tool_input = event_data.get("input") or {}
                             if tool_name == "task":
                                 subagent_name = "subagente"
+                                target_content = ""
                                 if isinstance(tool_input, dict):
                                     subagent_name = str(
                                         tool_input.get("subagent_type")
                                         or tool_input.get("name")
                                         or subagent_name
                                     )
+                                    target_content = str(
+                                        tool_input.get("task")
+                                        or tool_input.get("description")
+                                        or tool_input.get("input")
+                                        or ""
+                                    )
                                 subagent_run_names[run_id] = subagent_name
                                 await websocket.send_json({
                                     "type": "subagent_started",
                                     "subagent": subagent_name,
-                                    "message": f"Subagente iniciado: {subagent_name}",
+                                    "message": (
+                                        f"Subagente iniciado: {subagent_name}. "
+                                        f"Objetivo: {_preview_text(target_content)}"
+                                    ),
+                                })
+                            else:
+                                input_preview = _preview_text(_stringify_content(tool_input))
+                                await websocket.send_json({
+                                    "type": "tool_started",
+                                    "tool": tool_name,
+                                    "message": f"Herramienta iniciada: {tool_name}. Entrada: {input_preview}",
                                 })
                             continue
 
@@ -315,9 +479,17 @@ async def websocket_endpoint(websocket: WebSocket):
                                 await websocket.send_json({
                                     "type": "subagent_completed",
                                     "subagent": subagent_name,
-                                    "message": f"Subagente completado: {subagent_name}",
+                                    "message": (
+                                        f"Subagente completado: {subagent_name}. "
+                                        f"Salida: {_preview_text(preview)}"
+                                    ),
                                 })
                             else:
+                                await websocket.send_json({
+                                    "type": "tool_completed",
+                                    "tool": tool_name,
+                                    "message": f"Herramienta completada: {tool_name}.",
+                                })
                                 if preview:
                                     await websocket.send_json({
                                         "type": "tool_output_delta",
@@ -354,6 +526,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     final_message = _extract_final_message(result)
 
                 message = final_message or "Proceso completado sin mensaje final estructurado."
+                if single_run_workspace:
+                    (Path(single_run_workspace) / "final-response.md").write_text(message or "", encoding="utf-8")
 
                 await websocket.send_json({"type": "result", "message": message})
                 await websocket.send_json({"type": "stage", "message": "✅ Documentation workflow completed."})
@@ -367,6 +541,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
             finally:
                 set_progress_callback(None)
+                if single_run_workspace:
+                    set_output_workspace(None)
 
     except WebSocketDisconnect:
         return
